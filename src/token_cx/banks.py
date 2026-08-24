@@ -7,7 +7,7 @@ from pathlib import Path
 import pandas as pd
 import torch
 from huggingface_hub import hf_hub_download
-from safetensors.torch import load_file
+from safetensors.torch import load_file, save_file
 
 from .models import read_config
 
@@ -30,6 +30,11 @@ def _relative_error(matrix, activation, basis) -> float:
     )
     denominator = torch.linalg.vector_norm(matrix) + eps
     return float(residual / denominator)
+
+
+def _error_terms(matrix, activation, basis) -> tuple[float, float]:
+    residual = matrix - activation @ basis.T
+    return float(residual.square().sum()), float(matrix.square().sum())
 
 
 def normalize_basis(
@@ -187,17 +192,29 @@ def fit_basis(
     basis, scales = normalize_basis(basis)
     activation *= scales
 
+    reconstruction_error, input_norm = _error_terms(
+        matrix,
+        activation,
+        basis,
+    )
     diagnostics = {
-        "initial_relative_error": initial_error,
         "relative_error": _relative_error(
             matrix,
             activation,
             basis,
         ),
+        "reconstruction_squared_error": reconstruction_error,
+        "input_squared_norm": input_norm,
+        "initial_relative_error": initial_error,
         "nmf_epochs": int(epochs),
+        "nmf_steps": int(epochs),
+        "nmf_solver": "torch_mu",
         "nmf_init": "nndsvda",
-        "nmf_init_iterations": int(init_iterations),
+        "nmf_init_iters": int(init_iterations),
+        "nmf_device": str(matrix.device),
         "basis_normalization": "l2_columns",
+        "basis_scale_min_before": float(scales.min()),
+        "basis_scale_max_before": float(scales.max()),
     }
 
     return (
@@ -285,18 +302,83 @@ def infer_activation(
             converged = True
             break
 
+    reconstruction_error, input_norm = _error_terms(
+        matrix,
+        activation,
+        basis,
+    )
     diagnostics = {
         "relative_error": _relative_error(
             matrix,
             activation,
             basis,
         ),
+        "reconstruction_squared_error": reconstruction_error,
+        "input_squared_norm": input_norm,
         "relative_change": float(change),
         "iterations": int(iteration),
         "converged": converged,
     }
 
     return activation.cpu(), diagnostics
+
+
+def select_exemplars(
+    activation,
+    samples,
+    top_k: int = 10,
+) -> pd.DataFrame:
+    """Select one strongest patch per image, then rank images per concept."""
+    activation = _float_tensor(activation).cpu()
+    records = (
+        samples.to_dict("records")
+        if isinstance(samples, pd.DataFrame)
+        else list(samples)
+    )
+
+    if not records or top_k < 1:
+        raise ValueError(
+            "samples must be non-empty and top_k must be positive"
+        )
+
+    image_count = len(records)
+    if activation.ndim != 2 or len(activation) % image_count:
+        raise ValueError(
+            "activation rows must divide evenly across samples"
+        )
+
+    patches_per_image = len(activation) // image_count
+    activation = activation.reshape(
+        image_count,
+        patches_per_image,
+        -1,
+    )
+    values, patch_ids = activation.max(dim=1)
+
+    rows = []
+    for concept_id in range(activation.shape[-1]):
+        scores, image_ids = values[:, concept_id].topk(
+            min(top_k, image_count)
+        )
+        for exemplar_rank, (score, image_id) in enumerate(
+            zip(scores, image_ids),
+            start=1,
+        ):
+            image_id = int(image_id)
+            row = dict(records[image_id])
+            row.update(
+                {
+                    "concept_idx": int(concept_id),
+                    "exemplar_rank": int(exemplar_rank),
+                    "patch_id": int(
+                        patch_ids[image_id, concept_id]
+                    ),
+                    "activation": float(score),
+                }
+            )
+            rows.append(row)
+
+    return pd.DataFrame(rows)
 
 
 @dataclass(frozen=True)
@@ -329,12 +411,14 @@ class BankRepository:
         class_indices,
         exemplars,
         metadata,
+        diagnostics=None,
     ):
         self.backbone = backbone
         self.bases = bases.float().cpu()
         self.class_indices = class_indices.long().cpu()
         self.exemplars = exemplars
         self.metadata = metadata
+        self.diagnostics = diagnostics
 
         self._positions = {
             int(class_id): index
@@ -388,6 +472,7 @@ class BankRepository:
         for name in (
             "bases.safetensors",
             "exemplars.parquet",
+            "diagnostics.parquet",
             "config.json",
         ):
             paths[name] = hf_hub_download(
@@ -431,6 +516,141 @@ class BankRepository:
             class_indices=tensors["class_indices"],
             exemplars=exemplars,
             metadata=metadata,
+            diagnostics=pd.read_parquet(
+                paths["diagnostics.parquet"]
+            ),
+        )
+
+    @classmethod
+    def from_directory(
+        cls,
+        backbone: str,
+        directory: str | Path,
+        config_path: str | Path = "configs/token_cx.yaml",
+    ):
+        """Load one aggregate bank or a directory of completed class banks."""
+        directory = Path(directory)
+        config = read_config(config_path)
+
+        if backbone not in config["models"]:
+            raise ValueError(
+                f"Unknown backbone: {backbone}"
+            )
+
+        if (directory / "bases.safetensors").exists():
+            artifact_directories = [directory]
+        else:
+            artifact_directories = sorted(
+                path.parent
+                for path in directory.glob(
+                    "class_*/bases.safetensors"
+                )
+            )
+
+        if not artifact_directories:
+            raise FileNotFoundError(
+                f"No bank artifacts found in {directory}"
+            )
+
+        bases = []
+        class_indices = []
+        exemplar_frames = []
+        metadata_parts = []
+        diagnostic_frames = []
+        expected_rank = int(config["method"]["rank"])
+        expected_block = int(
+            config["method"]["evidence_block"]
+        )
+
+        for artifact_directory in artifact_directories:
+            tensors = load_file(
+                artifact_directory / "bases.safetensors"
+            )
+            part_bases = tensors["bases"].float()
+            part_classes = tensors["class_indices"].long()
+
+            if part_bases.ndim == 2:
+                part_bases = part_bases[None]
+
+            if len(part_bases) != len(part_classes):
+                raise ValueError(
+                    f"Invalid bank shapes in {artifact_directory}"
+                )
+
+            metadata = json.loads(
+                (
+                    artifact_directory / "config.json"
+                ).read_text(encoding="utf-8")
+            )
+
+            if int(metadata["rank"]) != expected_rank:
+                raise ValueError(
+                    f"Rank mismatch in {artifact_directory}"
+                )
+            if int(metadata["block_number"]) != expected_block:
+                raise ValueError(
+                    f"Block mismatch in {artifact_directory}"
+                )
+
+            bases.append(part_bases)
+            class_indices.append(part_classes)
+            exemplar_frames.append(
+                pd.read_parquet(
+                    artifact_directory / "exemplars.parquet"
+                )
+            )
+            metadata_parts.append(metadata)
+            diagnostic_path = (
+                artifact_directory / "diagnostics.parquet"
+            )
+            if diagnostic_path.exists():
+                diagnostic_frames.append(
+                    pd.read_parquet(diagnostic_path)
+                )
+
+        bases = torch.cat(bases)
+        class_indices = torch.cat(class_indices)
+
+        if len(class_indices.unique()) != len(class_indices):
+            raise ValueError(
+                "Local bank directory contains duplicate classes"
+            )
+
+        order = class_indices.argsort()
+        bases = bases[order]
+        class_indices = class_indices[order]
+        exemplars = pd.concat(
+            exemplar_frames,
+            ignore_index=True,
+        )
+        exemplars = exemplars.sort_values(
+            ["class_idx", "concept_idx", "exemplar_rank"]
+        ).reset_index(drop=True)
+
+        if diagnostic_frames and len(diagnostic_frames) != len(
+            artifact_directories
+        ):
+            raise ValueError(
+                "Local bank diagnostics are incomplete"
+            )
+
+        return cls(
+            backbone=backbone,
+            bases=bases,
+            class_indices=class_indices,
+            exemplars=exemplars,
+            metadata={
+                "source": "local",
+                "directory": str(directory.resolve()),
+                "rank": expected_rank,
+                "block_number": expected_block,
+                "parts": metadata_parts,
+            },
+            diagnostics=(
+                pd.concat(diagnostic_frames, ignore_index=True)
+                if diagnostic_frames
+                else None
+            ),
         )
 
     def get(self, class_id: int) -> ConceptBank:
@@ -450,3 +670,54 @@ class BankRepository:
             basis=self.bases[position],
             exemplars=exemplars,
         )
+
+
+def save_bank_artifacts(
+    directory: str | Path,
+    bases,
+    class_indices,
+    exemplars: pd.DataFrame,
+    metadata: dict,
+    diagnostics: pd.DataFrame | None = None,
+) -> Path:
+    """Save banks using the same file schema as the public artifacts."""
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=False)
+
+    bases = _float_tensor(bases).cpu().contiguous()
+    class_indices = torch.as_tensor(
+        class_indices,
+        dtype=torch.long,
+    ).cpu().contiguous()
+
+    if bases.ndim == 2:
+        bases = bases[None]
+
+    if bases.ndim != 3 or len(bases) != len(class_indices):
+        raise ValueError(
+            "bases must be [classes, dimensions, concepts]"
+        )
+
+    save_file(
+        {
+            "bases": bases,
+            "class_indices": class_indices,
+        },
+        directory / "bases.safetensors",
+    )
+    exemplars.to_parquet(
+        directory / "exemplars.parquet",
+        index=False,
+    )
+    (directory / "config.json").write_text(
+        json.dumps(metadata, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+
+    if diagnostics is not None:
+        diagnostics.to_parquet(
+            directory / "diagnostics.parquet",
+            index=False,
+        )
+
+    return directory

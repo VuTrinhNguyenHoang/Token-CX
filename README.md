@@ -158,6 +158,41 @@ qualitative ordering for Figures 5 and 6 without changing the
 activation-weighted Token-CX saliency. It requires the ImageNet Object
 Localization Challenge data and renders both figures directly.
 
+## Reproducing the experiments
+
+Both scripts use the immutable manifests and artifact revision declared in
+`configs/token_cx.yaml`. ImageNet images are not downloaded by the scripts;
+`--imagenet-root` must point to the ImageNet Object Localization Challenge
+directory containing `ILSVRC/Data/CLS-LOC` and `ILSVRC/Annotations/CLS-LOC`.
+
+Rebuild the class-specific DeiT concept banks:
+
+```bash
+python scripts/build_banks.py \
+  --backbone deit \
+  --imagenet-root /path/to/imagenet \
+  --output outputs/banks/deit
+```
+
+Bank construction is resumable at class granularity. Independent jobs can use
+`--class-start` and `--class-stop`; their `class_####` directories can then be
+placed under the same output root. ViT uses the identical command with
+`--backbone vit`.
+
+Evaluate the public precomputed banks on the fixed 5,000-image benchmark:
+
+```bash
+python scripts/evaluate.py \
+  --backbone deit \
+  --imagenet-root /path/to/imagenet \
+  --output outputs/evaluation/deit
+```
+
+Pass `--bank-dir outputs/banks/deit` to evaluate locally rebuilt banks. For a
+quick execution check, add `--limit 10`; limited runs are smoke tests and must
+not be reported as paper results. The evaluation writes per-image, per-class,
+and class-balanced summary CSV files and can resume from `per_sample.csv`.
+
 ## Main results
 
 | Backbone | Deletion AUC ↓ | Insertion AUC ↑ | Pointing Game ↑ |
@@ -182,12 +217,16 @@ Token-CX/
 │       ├── evaluation.py
 │       └── visualization.py
 ├── notebooks/
-│   └── token_cx_demo.ipynb
+│   └── demo.ipynb
+├── scripts/
+│   ├── build_banks.py
+│   └── evaluate.py
 └── tests/
 ```
 
 The reusable implementation is contained in `src/token_cx`; the notebook is a
-minimal reproduction of the two paper exemplar figures.
+minimal reproduction of the two paper exemplar figures, while the scripts
+rebuild the bank artifacts and quantitative results.
 
 ## Configuration
 
