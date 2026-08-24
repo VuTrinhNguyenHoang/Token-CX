@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+
+# Environments
+.venv/
+venv/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Local artifacts and experiment outputs
+.artifacts/
+outputs/
+
+# Large model and artifact files
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.zip
+
+# Editors and operating systems
+.vscode/
+.idea/
+.DS_Store

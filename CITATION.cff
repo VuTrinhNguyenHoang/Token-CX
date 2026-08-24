@@ -1,0 +1,21 @@
+cff-version: 1.2.0
+message: "If you use Token-CX in your research, please cite this software and the associated paper."
+title: "Token-CX: Token Concept-Based Explanations for Vision Transformers"
+type: software
+version: 0.1.0
+date-released: 2026-08-24
+
+authors:
+  - given-names: "Nguyen Hoang Vu"
+    family-names: "Trinh"
+
+repository-code: "https://github.com/VuTrinhNguyenHoang/Token-CX"
+url: "https://github.com/VuTrinhNguyenHoang/Token-CX"
+license: MIT
+
+keywords:
+  - explainable artificial intelligence
+  - concept-based explanation
+  - vision transformer
+  - non-negative matrix factorization
+  - model interpretability

@@ -1,0 +1,36 @@
+artifacts:
+  repo_id: trinhvu21/token-cx-artifacts
+  revision: "0a0a878aabd35664cf0885055cccffe8d35413d0"
+
+models:
+  vit:
+    display_name: ViT-B/16
+    timm_name: vit_base_patch16_224.augreg2_in21k_ft_in1k
+    artifact_folder: vit_b16
+    image_size: 224
+
+  deit:
+    display_name: DeiT-B/16-Distilled
+    timm_name: deit_base_distilled_patch16_224.fb_in1k
+    artifact_folder: deit_b16_distilled
+    image_size: 224
+
+method:
+  evidence_block: 9
+  spatial_block: 12
+  spatial_target: norm1
+  rank: 8
+  mask_gamma: 0.5
+  inference_iterations: 300
+
+bank:
+  images_per_class: 100
+  patches_per_image: 196
+  exemplars_per_concept: 10
+  nmf_epochs: 200
+  nndsvda_iterations: 4
+  random_state: 0
+
+evaluation:
+  steps: 100
+  batch_size: 128
